@@ -1,0 +1,8 @@
+{
+  "uuid": "cinnamon-taskbar-sysmon@example.com",
+  "name": "Cinnamon Taskbar Sysmon",
+  "description": "Displays CPU, Network, and File system load graphs in the Cinnamon panel",
+  "icon": "utilities-system-monitor",
+  "max-instances": "1",
+  "allowed-layout": ["both"]
+}

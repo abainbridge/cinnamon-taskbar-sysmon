@@ -1,0 +1,360 @@
+const Applet = imports.ui.applet;
+const St = imports.gi.St;
+const Clutter = imports.gi.Clutter;
+const GLib = imports.gi.GLib;
+const Pango = imports.gi.Pango;
+const PangoCairo = imports.gi.PangoCairo;
+
+class GnomeSysmonApplet extends Applet.Applet {
+    constructor(metadata, orientation, panel_height, instance_id) {
+        super(orientation, panel_height, instance_id);
+
+        this.metadata = metadata;
+
+        // Explicitly allow both horizontal and vertical panels
+        this.setAllowedLayout(Applet.AllowedLayout.BOTH);
+
+        // Scale graph dimensions to safely fit the panel thickness
+        const graphSize = Math.max(24, panel_height - 4);
+
+        // Check if the panel is on the left or right side
+        const isVertical = (orientation === St.Side.LEFT || orientation === St.Side.RIGHT);
+
+        // Container box: stack vertically on side panels, horizontally on top/bottom
+        this._box = new St.BoxLayout({
+            style_class: 'panel-status-indicators-box',
+            vertical: isVertical,
+            style: 'spacing: 2px;', // Adds a 2px gap between the graphs
+            x_align: Clutter.ActorAlign.CENTER,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+
+        // --- CPU State & Setup ---
+        this._prevIdle = 0;
+        this._prevTotal = 0;
+        this._cpuDataPoints = new Array(20).fill(0);
+
+        this._cpuDrawingArea = new St.DrawingArea({
+            width: graphSize,
+            height: graphSize,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        this._cpuDrawingArea.connect('repaint', (area) => this._drawCpuGraph(area));
+
+        // --- Network State & Setup ---
+        this._prevRxBytes = 0;
+        this._prevTxBytes = 0;
+        this._prevNetTime = 0;
+        this._rxDataPoints = new Array(20).fill(0);
+        this._txDataPoints = new Array(20).fill(0);
+
+        this._netDrawingArea = new St.DrawingArea({
+            width: graphSize,
+            height: graphSize,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        this._netDrawingArea.connect('repaint', (area) => this._drawNetGraph(area));
+
+        // --- File System IO State & Setup ---
+        this._prevReadBytes = 0;
+        this._prevWriteBytes = 0;
+        this._prevIoTime = 0;
+        this._readDataPoints = new Array(20).fill(0);
+        this._writeDataPoints = new Array(20).fill(0);
+
+        this._filesDrawingArea = new St.DrawingArea({
+            width: graphSize,
+            height: graphSize,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        this._filesDrawingArea.connect('repaint', (area) => this._drawFilesGraph(area));
+
+        // Add drawing areas to box and applet actor
+        this._box.add_child(this._cpuDrawingArea);
+        this._box.add_child(this._netDrawingArea);
+        this._box.add_child(this._filesDrawingArea);
+        this.actor.add_child(this._box);
+
+        // Prime initial readings
+        this._updateCpuUsage();
+        this._updateNetUsage();
+        this._updateIoUsage();
+
+        // Polling timer
+        this._timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
+            this._updateCpuUsage();
+            this._updateNetUsage();
+            this._updateIoUsage();
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    // --- CPU Drawing ---
+    _drawCpuGraph(area) {
+        const cr = area.get_context();
+        const [width, height] = area.get_surface_size();
+
+        cr.setSourceRGB(0.13, 0.28, 0.38);
+        cr.rectangle(0, 0, width, height);
+        cr.fill();
+
+        this._drawTextLabel(cr, 'cpu', height);
+        this._drawLinePath(cr, this._cpuDataPoints, [0.35, 0.65, 1.0], width, height, 100);
+
+        cr.$dispose();
+    }
+
+    // --- Network Drawing ---
+    _drawNetGraph(area) {
+        const cr = area.get_context();
+        const [width, height] = area.get_surface_size();
+
+        cr.setSourceRGB(0.13, 0.28, 0.38);
+        cr.rectangle(0, 0, width, height);
+        cr.fill();
+
+        this._drawTextLabel(cr, 'net', height);
+
+        const maxY = 3163;
+        this._drawLinePath(cr, this._rxDataPoints, [0.2, 0.6, 1.0], width, height, maxY);
+        this._drawLinePath(cr, this._txDataPoints, [1.0, 0.3, 0.3], width, height, maxY);
+
+        cr.$dispose();
+    }
+
+    // --- Files Drawing ---
+    _drawFilesGraph(area) {
+        const cr = area.get_context();
+        const [width, height] = area.get_surface_size();
+
+        cr.setSourceRGB(0.13, 0.28, 0.38);
+        cr.rectangle(0, 0, width, height);
+        cr.fill();
+
+        this._drawTextLabel(cr, 'files', height);
+
+        const maxY = 3163;
+        this._drawLinePath(cr, this._readDataPoints, [0.2, 0.6, 1.0], width, height, maxY);
+        this._drawLinePath(cr, this._writeDataPoints, [1.0, 0.3, 0.3], width, height, maxY);
+
+        cr.$dispose();
+    }
+
+    _drawTextLabel(cr, text, height) {
+        cr.save();
+        const layout = PangoCairo.create_layout(cr);
+        layout.set_text(text, -1);
+        const fontSize = Math.max(8, Math.min(12, Math.round(height * 0.25)));
+        const fontDesc = Pango.FontDescription.from_string(`Sans ${fontSize}`);
+        layout.set_font_description(fontDesc);
+        cr.setSourceRGBA(1.0, 1.0, 1.0, 0.4);
+        cr.translate(3, -2);
+        cr.scale(1.0, 0.85);
+        PangoCairo.show_layout(cr, layout);
+        cr.restore();
+    }
+
+    _drawLinePath(cr, dataPoints, colorRGB, width, height, maxValue) {
+        const count = dataPoints.length;
+        if (count < 2) return;
+
+        cr.setSourceRGB(colorRGB[0], colorRGB[1], colorRGB[2]);
+        cr.setLineWidth(1.0);
+
+        const stepX = width / (count - 1);
+
+        for (let i = 0; i < count; i++) {
+            const val = Math.max(0, Math.min(maxValue, dataPoints[i]));
+            const x = i * stepX;
+            const y = height - (val / maxValue) * height;
+
+            if (i === 0) {
+                cr.moveTo(x, y);
+            } else {
+                cr.lineTo(x, y);
+            }
+        }
+
+        cr.stroke();
+    }
+
+    _getCpuStats() {
+        try {
+            const [success, contents] = GLib.file_get_contents('/proc/stat');
+            if (!success) return null;
+
+            const text = new TextDecoder().decode(contents);
+            const firstLine = text.split('\n')[0];
+            const parts = firstLine.trim().split(/\s+/).slice(1).map(Number);
+
+            const idle = parts[3] + (parts[4] || 0);
+            const total = parts.reduce((acc, val) => acc + val, 0);
+
+            return { idle, total };
+        } catch (e) {
+            global.logError(`[SimpleSysmonApplet] Error reading /proc/stat: ${e}`);
+            return null;
+        }
+    }
+
+    _updateCpuUsage() {
+        const stats = this._getCpuStats();
+        if (!stats) return;
+
+        if (this._prevTotal !== 0) {
+            const deltaTotal = stats.total - this._prevTotal;
+            const deltaIdle = stats.idle - this._prevIdle;
+
+            if (deltaTotal > 0) {
+                const usage = Math.round(((deltaTotal - deltaIdle) / deltaTotal) * 100);
+                this._cpuDataPoints.shift();
+                this._cpuDataPoints.push(usage);
+                this._cpuDrawingArea.queue_repaint();
+            }
+        }
+
+        this._prevIdle = stats.idle;
+        this._prevTotal = stats.total;
+    }
+
+    _getNetStats() {
+        try {
+            const [success, contents] = GLib.file_get_contents('/proc/net/dev');
+            if (!success) return null;
+
+            const text = new TextDecoder().decode(contents);
+            const lines = text.split('\n');
+
+            let rxBytes = 0;
+            let txBytes = 0;
+
+            for (let i = 2; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (!line) continue;
+
+                const colonIdx = line.indexOf(':');
+                if (colonIdx === -1) continue;
+
+                const iface = line.substring(0, colonIdx).trim();
+                if (iface === 'lo') continue;
+
+                const parts = line.substring(colonIdx + 1).trim().split(/\s+/).map(Number);
+                if (parts.length >= 9) {
+                    rxBytes += parts[0];
+                    txBytes += parts[8];
+                }
+            }
+
+            return { rxBytes, txBytes };
+        } catch (e) {
+            global.logError(`[SimpleSysmonApplet] Error reading /proc/net/dev: ${e}`);
+            return null;
+        }
+    }
+
+    _updateNetUsage() {
+        const stats = this._getNetStats();
+        const now = GLib.get_monotonic_time();
+
+        if (!stats) return;
+
+        if (this._prevNetTime !== 0) {
+            const deltaTimeSec = (now - this._prevNetTime) / 1000000.0;
+
+            if (deltaTimeSec > 0) {
+                const rxSpeed = Math.max(0, (stats.rxBytes - this._prevRxBytes) / deltaTimeSec);
+                const txSpeed = Math.max(0, (stats.txBytes - this._prevTxBytes) / deltaTimeSec);
+
+                const rxTransformed = Math.sqrt(Math.min(10e6, rxSpeed));
+                const txTransformed = Math.sqrt(Math.min(10e6, txSpeed));
+
+                this._rxDataPoints.shift();
+                this._rxDataPoints.push(rxTransformed);
+
+                this._txDataPoints.shift();
+                this._txDataPoints.push(txTransformed);
+
+                this._netDrawingArea.queue_repaint();
+            }
+        }
+
+        this._prevRxBytes = stats.rxBytes;
+        this._prevTxBytes = stats.txBytes;
+        this._prevNetTime = now;
+    }
+
+    _getIoStats() {
+        try {
+            const [success, contents] = GLib.file_get_contents('/proc/diskstats');
+            if (!success) return null;
+
+            const text = new TextDecoder().decode(contents);
+            const lines = text.split('\n');
+
+            let readBytes = 0;
+            let writeBytes = 0;
+            const mainDeviceRegex = /^(sd[a-z]|nvme\d+n\d+|vd[a-z]|mmcblk\d+)$/;
+
+            for (const line of lines) {
+                const parts = line.trim().split(/\s+/);
+                if (parts.length < 14) continue;
+
+                const devName = parts[2];
+                if (mainDeviceRegex.test(devName)) {
+                    const sectorsRead = Number(parts[5]);
+                    const sectorsWritten = Number(parts[9]);
+
+                    readBytes += sectorsRead * 512;
+                    writeBytes += sectorsWritten * 512;
+                }
+            }
+
+            return { readBytes, writeBytes };
+        } catch (e) {
+            global.logError(`[SimpleSysmonApplet] Error reading /proc/diskstats: ${e}`);
+            return null;
+        }
+    }
+
+    _updateIoUsage() {
+        const stats = this._getIoStats();
+        const now = GLib.get_monotonic_time();
+
+        if (!stats) return;
+
+        if (this._prevIoTime !== 0) {
+            const deltaTimeSec = (now - this._prevIoTime) / 1000000.0;
+
+            if (deltaTimeSec > 0) {
+                const readSpeed = Math.max(0, (stats.readBytes - this._prevReadBytes) / deltaTimeSec);
+                const writeSpeed = Math.max(0, (stats.writeBytes - this._prevWriteBytes) / deltaTimeSec);
+
+                const readTransformed = Math.sqrt(Math.min(10e6, readSpeed));
+                const writeTransformed = Math.sqrt(Math.min(10e6, writeSpeed));
+
+                this._readDataPoints.shift();
+                this._readDataPoints.push(readTransformed);
+
+                this._writeDataPoints.shift();
+                this._writeDataPoints.push(writeTransformed);
+
+                this._filesDrawingArea.queue_repaint();
+            }
+        }
+
+        this._prevReadBytes = stats.readBytes;
+        this._prevWriteBytes = stats.writeBytes;
+        this._prevIoTime = now;
+    }
+
+    on_applet_removed_from_panel() {
+        if (this._timeoutId) {
+            GLib.Source.remove(this._timeoutId);
+            this._timeoutId = null;
+        }
+    }
+}
+
+function main(metadata, orientation, panel_height, instance_id) {
+    return new GnomeSysmonApplet(metadata, orientation, panel_height, instance_id);
+}
